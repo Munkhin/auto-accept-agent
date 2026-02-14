@@ -10,7 +10,7 @@ Auto Accept Agent needs CDP access to automatically click "Accept" buttons in yo
 
 ### Windows
 
-1. **Copy the setup script** from the Auto Accept setup panel
+1. **Copy the setup script below** (or from the Auto Accept setup panel)
 2. **Open PowerShell as Administrator**
    - Press Windows key
    - Type "PowerShell"
@@ -18,6 +18,62 @@ Auto Accept Agent needs CDP access to automatically click "Accept" buttons in yo
    - Select "Run as Administrator"
 3. **Paste and run the script**
 4. **Restart your IDE completely**
+
+**Setup Script:**
+```powershell
+Write-Host "=== Antigravity CDP Setup ===" -ForegroundColor Cyan
+Write-Host "Searching for Antigravity shortcuts..." -ForegroundColor Yellow
+
+$searchLocations = @(
+    [Environment]::GetFolderPath('Desktop'),
+    "$env:USERPROFILE\Desktop",
+    "$env:USERPROFILE\OneDrive\Desktop",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+    "$env:USERPROFILE\AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+)
+
+$WshShell = New-Object -ComObject WScript.Shell
+$foundShortcuts = @()
+
+foreach ($location in $searchLocations) {
+    if (Test-Path $location) {
+        $shortcuts = Get-ChildItem -Path $location -Recurse -Filter "*.lnk" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "*Antigravity*" }
+        $foundShortcuts += $shortcuts
+    }
+}
+
+if ($foundShortcuts.Count -eq 0) {
+    $exePath = "$env:LOCALAPPDATA\Programs\Antigravity\Antigravity.exe"
+    if (Test-Path $exePath) {
+        $desktopPath = [Environment]::GetFolderPath('Desktop')
+        $shortcutPath = "$desktopPath\Antigravity.lnk"
+        $shortcut = $WshShell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $exePath
+        $shortcut.Arguments = "--remote-debugging-port=9000"
+        $shortcut.Save()
+        Write-Host "Created new shortcut: $shortcutPath" -ForegroundColor Green
+    } else {
+        Write-Host "ERROR: Antigravity.exe not found." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    foreach ($shortcutFile in $foundShortcuts) {
+        $shortcut = $WshShell.CreateShortcut($shortcutFile.FullName)
+        $originalArgs = $shortcut.Arguments
+        if ($originalArgs -match "--remote-debugging-port=\d+") {
+            $shortcut.Arguments = $originalArgs -replace "--remote-debugging-port=\d+", "--remote-debugging-port=9000"
+        } else {
+            $shortcut.Arguments = "--remote-debugging-port=9000 " + $originalArgs
+        }
+        $shortcut.Save()
+        Write-Host "Updated: $($shortcutFile.Name)" -ForegroundColor Green
+    }
+}
+
+Write-Host "=== Setup Complete ===" -ForegroundColor Cyan
+```
 
 The script will:
 - Search for your IDE shortcuts (Desktop, Start Menu, Taskbar)
