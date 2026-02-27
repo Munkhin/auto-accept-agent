@@ -51,12 +51,164 @@
     };
 
     // =================================================================
-    // SIMPLE POLL: NO-OP
-    // Command-based auto-accept runs from the extension (vscode.commands)
+    // SIMPLE POLL: BUTTON CLICKING + BANNED COMMAND DETECTION
+    // (ported from compositor + modules/03_clicking.js)
     // =================================================================
 
+    const acceptPatterns = ['accept', 'run', 'retry', 'apply', 'execute', 'confirm', 'always allow', 'allow once', 'allow'];
+    const rejectPatterns = ['skip', 'reject', 'cancel', 'close', 'refine'];
+    const COMMAND_ELEMENTS = ['pre', 'code', 'pre code'];
+
+    // --- BANNED COMMAND DETECTION (from modules/03_clicking.js) ---
+
+    function findNearbyCommandText(el) {
+        let commandText = '';
+
+        // Walk up DOM tree looking for nearby <pre>/<code> elements
+        let container = el.parentElement;
+        let depth = 0;
+        while (container && depth < 10) {
+            let sibling = container.previousElementSibling;
+            let siblingCount = 0;
+            while (sibling && siblingCount < 5) {
+                if (sibling.tagName === 'PRE' || sibling.tagName === 'CODE') {
+                    const text = sibling.textContent.trim();
+                    if (text.length > 0) commandText += ' ' + text;
+                }
+                for (const selector of COMMAND_ELEMENTS) {
+                    try {
+                        const codeElements = sibling.querySelectorAll(selector);
+                        for (const codeEl of codeElements) {
+                            if (codeEl && codeEl.textContent) {
+                                const text = codeEl.textContent.trim();
+                                if (text.length > 0 && text.length < 5000) commandText += ' ' + text;
+                            }
+                        }
+                    } catch (e) { }
+                }
+                sibling = sibling.previousElementSibling;
+                siblingCount++;
+            }
+            if (commandText.length > 10) break;
+            container = container.parentElement;
+            depth++;
+        }
+
+        // Fallback: check immediate button siblings
+        if (commandText.length === 0) {
+            let btnSibling = el.previousElementSibling;
+            let count = 0;
+            while (btnSibling && count < 3) {
+                for (const selector of COMMAND_ELEMENTS) {
+                    try {
+                        const codeElements = btnSibling.querySelectorAll ? btnSibling.querySelectorAll(selector) : [];
+                        for (const codeEl of codeElements) {
+                            if (codeEl && codeEl.textContent) commandText += ' ' + codeEl.textContent.trim();
+                        }
+                    } catch (e) { }
+                }
+                btnSibling = btnSibling.previousElementSibling;
+                count++;
+            }
+        }
+
+        if (el.getAttribute('aria-label')) commandText += ' ' + el.getAttribute('aria-label');
+        if (el.getAttribute('title')) commandText += ' ' + el.getAttribute('title');
+
+        return commandText.trim().toLowerCase();
+    }
+
+    function isCommandBanned(commandText) {
+        const state = window.__autoAcceptState;
+        const bannedList = state ? (state.bannedCommands || []) : [];
+        if (bannedList.length === 0 || !commandText) return false;
+
+        const lowerText = commandText.toLowerCase();
+
+        for (const banned of bannedList) {
+            const pattern = (banned || '').trim();
+            if (!pattern) continue;
+
+            try {
+                // Support regex patterns: /pattern/flags
+                if (pattern.startsWith('/') && pattern.lastIndexOf('/') > 0) {
+                    const lastSlash = pattern.lastIndexOf('/');
+                    const regex = new RegExp(pattern.substring(1, lastSlash), pattern.substring(lastSlash + 1) || 'i');
+                    if (regex.test(commandText)) {
+                        log(`[BANNED] Blocked by regex: ${pattern}`);
+                        if (state) state.blocked = (state.blocked || 0) + 1;
+                        return true;
+                    }
+                } else {
+                    if (lowerText.includes(pattern.toLowerCase())) {
+                        log(`[BANNED] Blocked by pattern: "${pattern}"`);
+                        if (state) state.blocked = (state.blocked || 0) + 1;
+                        return true;
+                    }
+                }
+            } catch (e) {
+                if (lowerText.includes(pattern.toLowerCase())) {
+                    log(`[BANNED] Blocked (fallback): "${pattern}"`);
+                    if (state) state.blocked = (state.blocked || 0) + 1;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // --- BUTTON DETECTION ---
+
+    function isAcceptButton(el) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (text.length === 0 || text.length > 50) return false;
+
+        for (const rp of rejectPatterns) {
+            if (text.indexOf(rp) !== -1) return false;
+        }
+        let matched = false;
+        for (const ap of acceptPatterns) {
+            if (text.indexOf(ap) !== -1) { matched = true; break; }
+        }
+        if (!matched) return false;
+
+        // Check banned commands for run/execute buttons
+        if (text.includes('run') || text.includes('execute')) {
+            const nearbyText = findNearbyCommandText(el);
+            if (isCommandBanned(nearbyText)) return false;
+        }
+
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== 'none' && rect.width > 0 && style.pointerEvents !== 'none' && !el.disabled;
+    }
+
+    function getButtonSelectors() {
+        const state = window.__autoAcceptState;
+        const ide = state ? state.ide : 'cursor';
+        if (ide === 'antigravity') {
+            return ['.bg-ide-button-background', 'button.cursor-pointer', 'button'];
+        }
+        return ['button', '[class*="button"]', '[class*="anysphere"]'];
+    }
+
     function clickAcceptButtons() {
-        return 0;
+        const selectors = getButtonSelectors();
+        let clicked = 0;
+        for (const selector of selectors) {
+            const els = queryAll(selector);
+            for (const el of els) {
+                if (isAcceptButton(el)) {
+                    const btnText = (el.textContent || '').trim();
+                    log(`Clicking: "${btnText}"`);
+                    el.dispatchEvent(new MouseEvent('click', { view: window, bubbles: true, cancelable: true }));
+                    clicked++;
+                    const state = window.__autoAcceptState;
+                    if (state) state.clicks = (state.clicks || 0) + 1;
+                }
+            }
+        }
+        return clicked;
     }
 
     // =================================================================
@@ -65,6 +217,17 @@
 
     const OVERLAY_ID = '__autoAcceptBgOverlay';
     const STYLE_ID = '__autoAcceptBgStyles';
+    const SUMMARY_WIDGET_ID = '__autoAcceptSummaryWidget';
+    const SUMMARY_STYLE_ID = '__autoAcceptSummaryStyles';
+    const SUMMARY_BUTTON_ID = '__autoAcceptSummaryButton';
+    const SUMMARY_STATUS_ID = '__autoAcceptSummaryStatus';
+    const SUMMARY_BODY_ID = '__autoAcceptSummaryBody';
+    const PANEL_SELECTORS = [
+        '#antigravity\\.agentPanel',
+        '#workbench\\.parts\\.auxiliarybar',
+        '.auxiliary-bar-container',
+        '#workbench\\.parts\\.sidebar'
+    ];
 
     const OVERLAY_STYLES = `
         #__autoAcceptBgOverlay {
@@ -164,6 +327,82 @@
         }
     `;
 
+    const SUMMARY_STYLES = `
+        #__autoAcceptSummaryWidget {
+            position: fixed;
+            z-index: 2147483646;
+            width: 340px;
+            max-height: 60vh;
+            padding: 12px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            background: rgba(12, 12, 16, 0.96);
+            color: #f6f6f6;
+            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        #__autoAcceptSummaryWidget .aas-title {
+            font-size: 12px;
+            font-weight: 600;
+            opacity: 0.95;
+            letter-spacing: 0.2px;
+        }
+        #__autoAcceptSummaryButton {
+            height: 30px;
+            border: 0;
+            border-radius: 6px;
+            background: #2563eb;
+            color: #fff;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        #__autoAcceptSummaryButton[disabled] {
+            opacity: 0.6;
+            cursor: default;
+        }
+        #__autoAcceptSummaryStatus {
+            font-size: 11px;
+            min-height: 15px;
+            opacity: 0.8;
+        }
+        #__autoAcceptSummaryBody {
+            white-space: pre-wrap;
+            font-size: 12px;
+            line-height: 1.45;
+            overflow: auto;
+            max-height: 42vh;
+            padding-right: 2px;
+        }
+        #__autoAcceptSummaryWidget.error #__autoAcceptSummaryStatus {
+            color: #fca5a5;
+        }
+    `;
+
+    function isElementVisible(el) {
+        if (!el || !el.ownerDocument) return false;
+        try {
+            const style = window.getComputedStyle(el);
+            if (!style) return false;
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function findAgentPanel() {
+        for (const selector of PANEL_SELECTORS) {
+            const found = queryAll(selector).find(p => p.offsetWidth > 50 && p.offsetHeight > 50);
+            if (found) return found;
+        }
+        return null;
+    }
+
     // --- Tab name utilities (from background_mode.js) ---
 
     const stripTimeSuffix = (text) => {
@@ -254,15 +493,8 @@
         overlay.appendChild(container);
         document.body.appendChild(overlay);
 
-        const panelSelectors = [
-            '#antigravity\\.agentPanel',
-            '#workbench\\.parts\\.auxiliarybar',
-            '.auxiliary-bar-container',
-            '#workbench\\.parts\\.sidebar'
-        ];
-
         let panel = null;
-        for (const selector of panelSelectors) {
+        for (const selector of PANEL_SELECTORS) {
             const found = queryAll(selector).find(p => p.offsetWidth > 50);
             if (found) {
                 panel = found;
@@ -308,6 +540,179 @@
         }
         overlay.classList.remove('visible');
         setTimeout(() => overlay.remove(), 300);
+    }
+
+    function setSummaryWidgetState(payload) {
+        const widget = document.getElementById(SUMMARY_WIDGET_ID);
+        if (!widget) return;
+        const button = document.getElementById(SUMMARY_BUTTON_ID);
+        const status = document.getElementById(SUMMARY_STATUS_ID);
+        const body = document.getElementById(SUMMARY_BODY_ID);
+        const state = payload || {};
+        const statusType = state.status || 'idle';
+
+        widget.classList.toggle('error', statusType === 'error');
+
+        if (statusType === 'loading') {
+            if (button) {
+                button.disabled = true;
+                button.textContent = 'Summarizing...';
+            }
+            if (status) status.textContent = 'Generating session recap...';
+            if (body && !body.textContent) body.textContent = '';
+            return;
+        }
+
+        if (statusType === 'success') {
+            if (button) {
+                button.disabled = false;
+                button.textContent = 'Regenerate Summary';
+            }
+            if (status) status.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+            if (body) body.textContent = String(state.summary || '').trim();
+            return;
+        }
+
+        if (statusType === 'error') {
+            if (button) {
+                button.disabled = false;
+                button.textContent = 'Retry Summary';
+            }
+            if (status) status.textContent = String(state.error || 'Failed to generate summary.');
+            if (body && !body.textContent) body.textContent = '';
+            return;
+        }
+
+        if (button) {
+            button.disabled = false;
+            button.textContent = 'Summarize Session';
+        }
+        if (status) status.textContent = 'Click to generate a recap for this session.';
+    }
+
+    function mountSummaryWidget() {
+        if (document.getElementById(SUMMARY_WIDGET_ID)) return;
+
+        if (!document.getElementById(SUMMARY_STYLE_ID)) {
+            const style = document.createElement('style');
+            style.id = SUMMARY_STYLE_ID;
+            style.textContent = SUMMARY_STYLES;
+            document.head.appendChild(style);
+        }
+
+        const widget = document.createElement('div');
+        widget.id = SUMMARY_WIDGET_ID;
+        widget.innerHTML = `
+            <div class="aas-title">Auto Accept Session Recap</div>
+            <button id="${SUMMARY_BUTTON_ID}" type="button">Summarize Session</button>
+            <div id="${SUMMARY_STATUS_ID}"></div>
+            <div id="${SUMMARY_BODY_ID}"></div>
+        `;
+        document.body.appendChild(widget);
+
+        const panel = findAgentPanel();
+        const syncPosition = () => {
+            if (panel && panel.getBoundingClientRect) {
+                const rect = panel.getBoundingClientRect();
+                widget.style.left = `${Math.max(8, rect.right - widget.offsetWidth - 12)}px`;
+                widget.style.top = `${Math.max(8, rect.bottom - Math.min(rect.height - 10, widget.offsetHeight + 12))}px`;
+            } else {
+                widget.style.right = '18px';
+                widget.style.bottom = '18px';
+                widget.style.left = 'auto';
+                widget.style.top = 'auto';
+            }
+        };
+        syncPosition();
+        widget._onWindowResize = syncPosition;
+        window.addEventListener('resize', syncPosition);
+
+        if (panel) {
+            const resizeObserver = new ResizeObserver(syncPosition);
+            resizeObserver.observe(panel);
+            widget._resizeObserver = resizeObserver;
+        }
+
+        const button = document.getElementById(SUMMARY_BUTTON_ID);
+        if (button) {
+            button.addEventListener('click', () => {
+                const state = window.__autoAcceptState;
+                if (!state || state.summaryRequestPending) return;
+                state.summaryRequestPending = true;
+                state.summaryRequestedAt = Date.now();
+                setSummaryWidgetState({ status: 'loading' });
+            });
+        }
+
+        setSummaryWidgetState({ status: 'idle' });
+        log('[Summary] Widget mounted');
+    }
+
+    function dismountSummaryWidget() {
+        const widget = document.getElementById(SUMMARY_WIDGET_ID);
+        if (!widget) return;
+        if (widget._resizeObserver) widget._resizeObserver.disconnect();
+        if (widget._onWindowResize) window.removeEventListener('resize', widget._onWindowResize);
+        widget.remove();
+        log('[Summary] Widget dismounted');
+    }
+
+    function collectVisibleConversationText(maxChars = 12000) {
+        const root = findAgentPanel() || document.body;
+        if (!root) return '';
+
+        const selectors = [
+            '[data-role="assistant"]',
+            '[data-testid*="assistant"]',
+            '.assistant',
+            '.message.assistant',
+            '.chat-message',
+            '.markdown',
+            'article',
+            'p',
+            'li',
+            'pre',
+            'code'
+        ];
+
+        const snippets = [];
+        const seen = new Set();
+        let total = 0;
+        let stop = false;
+
+        for (const selector of selectors) {
+            if (stop) break;
+            let elements = [];
+            try {
+                elements = Array.from(root.querySelectorAll(selector));
+            } catch (e) {
+                elements = [];
+            }
+            for (const el of elements) {
+                if (!isElementVisible(el)) continue;
+                let text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (text.length < 24) continue;
+                if (text.length > 1800) {
+                    text = `${text.slice(0, 1800)}...`;
+                }
+                const key = text.slice(0, 160);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                snippets.push(text);
+                total += text.length + 2;
+                if (total >= maxChars) {
+                    stop = true;
+                    break;
+                }
+            }
+        }
+
+        if (snippets.length === 0) {
+            const fallback = (root.innerText || '').replace(/\s+/g, ' ').trim();
+            return fallback.slice(0, maxChars);
+        }
+
+        return snippets.join('\n\n').slice(0, maxChars);
     }
 
     function loadTabsOntoOverlay(tabNames) {
@@ -574,18 +979,75 @@
             isRunning: false,
             sessionID: 0,
             clicks: 0,
+            blocked: 0,
+            fileEdits: 0,
+            terminalCommands: 0,
             clickInterval: null,
             mode: null,
             ide: null,
+            pollInterval: 1000,
+            bannedCommands: [],
             // Background mode fields (from background_mode.js)
             tabNames: [],
             completionStatus: {},
-            _noTabCycles: 0
+            _noTabCycles: 0,
+            summaryRequestPending: false,
+            summaryRequestedAt: 0,
+            lastSummary: ''
         };
     }
 
     window.__autoAcceptGetStats = function() {
-        return { clicks: window.__autoAcceptState.clicks || 0 };
+        const s = window.__autoAcceptState || {};
+        return {
+            clicks: s.clicks || 0,
+            blocked: s.blocked || 0,
+            fileEdits: s.fileEdits || 0,
+            terminalCommands: s.terminalCommands || 0
+        };
+    };
+
+    window.__autoAcceptConsumeSummaryRequest = function() {
+        const s = window.__autoAcceptState || {};
+        if (!s.summaryRequestPending) return { requested: false };
+        s.summaryRequestPending = false;
+        return {
+            requested: true,
+            requestedAt: s.summaryRequestedAt || Date.now()
+        };
+    };
+
+    window.__autoAcceptSetSummaryResult = function(payload) {
+        const s = window.__autoAcceptState || {};
+        const p = payload || {};
+        if (p.status === 'loading') {
+            setSummaryWidgetState({ status: 'loading' });
+            return;
+        }
+
+        if (p.status === 'success') {
+            s.lastSummary = String(p.summary || '');
+            setSummaryWidgetState({
+                status: 'success',
+                summary: s.lastSummary
+            });
+            return;
+        }
+
+        if (p.status === 'error') {
+            setSummaryWidgetState({
+                status: 'error',
+                error: String(p.error || 'Failed to generate summary.')
+            });
+            return;
+        }
+
+        setSummaryWidgetState({ status: 'idle' });
+    };
+
+    window.__autoAcceptGetVisibleConversationText = function(maxChars) {
+        const cap = Number(maxChars) > 0 ? Number(maxChars) : 12000;
+        return collectVisibleConversationText(cap);
     };
 
     window.__autoAcceptStart = function(config) {
@@ -601,23 +1063,33 @@
         state.sessionID++;
         state.mode = config.isBackgroundMode ? 'background' : 'simple';
         state.ide = (config.ide || 'cursor').toLowerCase();
+        state.pollInterval = config.pollInterval || 1000;
         state.tabNames = [];
         state.completionStatus = {};
         state._noTabCycles = 0;
+        state.summaryRequestPending = false;
+        state.summaryRequestedAt = 0;
 
-        log(`Starting ${state.mode} mode for ${state.ide}...`);
+        // Apply banned commands if provided
+        if (config.bannedCommands) {
+            state.bannedCommands = Array.isArray(config.bannedCommands) ? config.bannedCommands : [];
+            log(`Banned commands loaded: ${state.bannedCommands.length} patterns`);
+        }
 
-        // ALWAYS start clicking loop (simple poll - proven working)
+        log(`Starting ${state.mode} mode for ${state.ide} (interval=${state.pollInterval}ms)...`);
+
+        // ALWAYS start clicking loop using configured poll interval
         state.clickInterval = setInterval(() => {
             if (state.isRunning) {
                 clickAcceptButtons();
             }
-        }, 300);
+        }, state.pollInterval);
 
-        log('Clicking loop started (300ms interval)');
+        log(`Clicking loop started (${state.pollInterval}ms interval)`);
 
         // ONLY start tab cycling + overlay if background mode enabled
         if (config.isBackgroundMode) {
+            dismountSummaryWidget();
             // Mount overlay immediately
             mountOverlay();
 
@@ -635,6 +1107,10 @@
             }, 1000);
 
             log('Background mode: overlay mounted, tab cycling starting in 1s');
+        } else {
+            dismountOverlay();
+            mountSummaryWidget();
+            setSummaryWidgetState({ status: 'idle' });
         }
 
         log('Active!');
@@ -651,13 +1127,20 @@
 
         // Dismount overlay if it was mounted (safe to call even if no overlay)
         dismountOverlay();
+        dismountSummaryWidget();
 
         log('Stopped');
     };
 
     // Compatibility placeholders for cdp-handler.js
     window.__autoAcceptSetFocusState = function() {};
-    window.__autoAcceptUpdateBannedCommands = function() {};
+    window.__autoAcceptUpdateBannedCommands = function(bannedList) {
+        const state = window.__autoAcceptState;
+        if (state) {
+            state.bannedCommands = Array.isArray(bannedList) ? bannedList : [];
+            log(`Banned commands updated: ${state.bannedCommands.length} patterns`);
+        }
+    };
 
     log('Ready');
 })();

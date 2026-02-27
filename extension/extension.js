@@ -1,6 +1,6 @@
 const vscode = require('vscode');
 const path = require('path');
-const payment = require('./payment-handler');
+const https = require('https');
 
 // Lazy load SettingsPanel to avoid blocking activation
 let SettingsPanel = null;
@@ -18,63 +18,45 @@ function getSettingsPanel() {
 // states
 
 const GLOBAL_STATE_KEY = 'auto-accept-enabled-global';
+const PRO_STATE_KEY = 'auto-accept-isPro';
+const FREQ_STATE_KEY = 'auto-accept-frequency';
 const BANNED_COMMANDS_KEY = 'auto-accept-banned-commands';
-// Locking
-const LOCK_KEY = 'auto-accept-instance-lock';
-const HEARTBEAT_KEY = 'auto-accept-instance-heartbeat';
-const INSTANCE_ID = Math.random().toString(36).substring(7);
-
+const ROI_STATS_KEY = 'auto-accept-roi-stats'; // For ROI notification
+const SECONDS_PER_CLICK = 5; // Conservative estimate: 5 seconds saved per auto-accept
+const LICENSE_API = 'https://auto-accept-backend.onrender.com/api';
 let isEnabled = false;
+let isPro = false;
 let isLockedOut = false; // Local tracking
-let pollFrequency = 2000; // Default for Free
+let pollFrequency = 1000; // Default polling interval
 let bannedCommands = []; // List of command patterns to block
 
 // Background Mode state
 let backgroundModeEnabled = false;
 const BACKGROUND_DONT_SHOW_KEY = 'auto-accept-background-dont-show';
 const BACKGROUND_MODE_KEY = 'auto-accept-background-mode';
-const VERSION_7_0_KEY = 'auto-accept-version-7.0-notification-shown';
-const VERSION_8_6_0_KEY = 'auto-accept-version-8.6-notification-shown';
-const RELEASY_PROMO_KEY = 'auto-accept-releasy-promo-shown';
+const FIRST_INSTALL_KEY = 'auto-accept-first-install-complete';
+const SUMMARY_API_URL = `${LICENSE_API}/session-summary`;
+const SESSION_LOG_LIMIT = 300;
+const LOG_LINE_MAX_CHARS = 500;
+const VISIBLE_TEXT_MAX_CHARS = 12000;
+const SUMMARY_REQUEST_TIMEOUT_MS = 8000;
 
 let pollTimer;
-let commandPollTimer;
+let statsCollectionTimer; // For periodic stats collection
 let statusBarItem;
 let statusSettingsItem;
 let statusBackgroundItem; // New: Background Mode toggle
 let outputChannel;
 let currentIDE = 'unknown'; // 'cursor' | 'antigravity'
 let globalContext;
+let summaryRequestInFlight = false;
+let currentSession = null;
+let sessionLogBuffer = [];
+let sessionCounter = 0;
+let lastSessionSummary = null;
 
-// Command-based auto-accept (IDE native)
-const ACCEPT_COMMANDS_ANTIGRAVITY = [
-    'antigravity.agent.acceptAgentStep',
-    'antigravity.command.accept',
-    'antigravity.prioritized.agentAcceptAllInFile',
-    'antigravity.prioritized.agentAcceptFocusedHunk',
-    'antigravity.prioritized.supercompleteAccept',
-    'antigravity.terminalCommand.accept',
-    'antigravity.acceptCompletion',
-    'antigravity.prioritized.terminalSuggestion.accept'
-];
-
-const ACCEPT_COMMANDS_CURSOR = [
-    'cursorai.action.acceptAndRunGenerateInTerminal',
-    'cursorai.action.acceptGenerateInTerminal'
-];
-
-function getAcceptCommandsForIDE() {
-    const ide = (currentIDE || '').toLowerCase();
-    if (ide === 'antigravity') return ACCEPT_COMMANDS_ANTIGRAVITY;
-    if (ide === 'cursor') return ACCEPT_COMMANDS_CURSOR;
-    return [];
-}
-
-async function executeAcceptCommandsForIDE() {
-    const commands = getAcceptCommandsForIDE();
-    if (commands.length === 0) return;
-    await Promise.allSettled(commands.map(cmd => vscode.commands.executeCommand(cmd)));
-}
+// Button clicking is handled entirely via CDP injection (auto_accept.js)
+// No IDE command execution — all accept actions are DOM button clicks
 
 // Handlers (used by both IDEs now)
 let cdpHandler;
@@ -85,6 +67,10 @@ function log(message) {
         const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
         const logLine = `[${timestamp}] ${message}`;
         console.log(logLine);
+        if (outputChannel) {
+            outputChannel.appendLine(logLine);
+        }
+        appendSessionLog(logLine);
     } catch (e) {
         console.error('Logging failed:', e);
     }
@@ -97,31 +83,215 @@ function detectIDE() {
     return 'Code'; // only supporting these 3 for now
 }
 
+function appendSessionLog(line) {
+    if (!line) return;
+    sessionLogBuffer.push(String(line).slice(0, LOG_LINE_MAX_CHARS));
+    if (sessionLogBuffer.length > SESSION_LOG_LIMIT) {
+        sessionLogBuffer = sessionLogBuffer.slice(sessionLogBuffer.length - SESSION_LOG_LIMIT);
+    }
+}
+
+function ensureSessionStarted() {
+    if (currentSession && !currentSession.endedAt) return;
+    sessionCounter += 1;
+    lastSessionSummary = null;
+    currentSession = {
+        sessionId: `session-${Date.now()}-${sessionCounter}`,
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        ide: String(currentIDE || 'unknown').toLowerCase(),
+        backgroundMode: !!backgroundModeEnabled
+    };
+    sessionLogBuffer = [];
+    appendSessionLog(`[SESSION] Started ${currentSession.sessionId}`);
+}
+
+function markSessionEnded() {
+    if (!currentSession || currentSession.endedAt) return;
+    currentSession.endedAt = new Date().toISOString();
+    appendSessionLog(`[SESSION] Ended ${currentSession.sessionId}`);
+}
+
+function truncateText(text, maxChars) {
+    const value = String(text || '');
+    if (value.length <= maxChars) return value;
+    return `${value.slice(0, maxChars)}...`;
+}
+
+function redactSensitiveText(text) {
+    return String(text || '')
+        .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, '[REDACTED_KEY]')
+        .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s]+/ig, '$1[REDACTED_TOKEN]')
+        .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[REDACTED_EMAIL]');
+}
+
+function normalizeStats(stats) {
+    const base = stats || {};
+    return {
+        clicks: Number(base.clicks || 0),
+        blocked: Number(base.blocked || 0),
+        fileEdits: Number(base.fileEdits || 0),
+        terminalCommands: Number(base.terminalCommands || 0)
+    };
+}
+
+function hasMeaningfulSummaryInput(stats, logs, visibleConversationText) {
+    const s = normalizeStats(stats);
+    const totalStats = s.clicks + s.blocked + s.fileEdits + s.terminalCommands;
+    return totalStats > 0 || logs.length > 0 || String(visibleConversationText || '').trim().length > 0;
+}
+
+function buildSummaryPayload(context, stats, visibleConversationText) {
+    const safeLogs = sessionLogBuffer.map(line => truncateText(redactSensitiveText(line), LOG_LINE_MAX_CHARS));
+    const sessionMeta = {
+        sessionId: currentSession?.sessionId || `session-${Date.now()}-ad-hoc`,
+        startedAt: currentSession?.startedAt || null,
+        endedAt: currentSession?.endedAt || null,
+        generatedAt: new Date().toISOString(),
+        ide: currentSession?.ide || String(currentIDE || 'unknown').toLowerCase(),
+        backgroundMode: currentSession?.backgroundMode ?? !!backgroundModeEnabled
+    };
+
+    return {
+        userId: context.globalState.get('auto-accept-userId') || null,
+        sessionMeta,
+        stats: normalizeStats(stats),
+        logs: safeLogs,
+        visibleConversationText: truncateText(redactSensitiveText(visibleConversationText), VISIBLE_TEXT_MAX_CHARS)
+    };
+}
+
+async function postJson(url, payload, timeoutMs = SUMMARY_REQUEST_TIMEOUT_MS) {
+    const body = JSON.stringify(payload || {});
+    return new Promise((resolve, reject) => {
+        const req = https.request(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: timeoutMs
+        }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode < 200 || res.statusCode >= 300) {
+                    return reject(new Error(`Summary API failed with status ${res.statusCode}`));
+                }
+                try {
+                    resolve(data ? JSON.parse(data) : {});
+                } catch (e) {
+                    reject(new Error('Summary API returned invalid JSON.'));
+                }
+            });
+        });
+
+        req.on('timeout', () => req.destroy(new Error('Summary API timed out.')));
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+
+async function generateSessionSummary(context, options = {}) {
+    if (!context) throw new Error('Extension context unavailable.');
+
+    if (summaryRequestInFlight) {
+        if (!options.silent) {
+            vscode.window.showInformationMessage('Auto Accept: Summary generation is already in progress.');
+        }
+        return lastSessionSummary;
+    }
+
+    const targetPageId = options.pageId || null;
+    summaryRequestInFlight = true;
+    if (targetPageId && cdpHandler) {
+        await cdpHandler.pushSummaryResult(targetPageId, { status: 'loading' });
+    }
+
+    try {
+        const stats = cdpHandler ? await cdpHandler.getSessionSummary() : normalizeStats();
+        const visibleConversationText = cdpHandler
+            ? await cdpHandler.getVisibleConversationText(targetPageId, VISIBLE_TEXT_MAX_CHARS)
+            : '';
+        const payload = buildSummaryPayload(context, stats, visibleConversationText);
+
+        if (!hasMeaningfulSummaryInput(payload.stats, payload.logs, payload.visibleConversationText)) {
+            throw new Error('Not enough session data to summarize yet.');
+        }
+
+        const response = await postJson(SUMMARY_API_URL, payload, SUMMARY_REQUEST_TIMEOUT_MS);
+        const summaryText = String(response.summary || '').trim();
+        if (!summaryText) {
+            throw new Error('Summary API returned empty summary text.');
+        }
+
+        lastSessionSummary = {
+            summary: summaryText,
+            generatedAt: new Date().toISOString(),
+            sessionId: payload.sessionMeta.sessionId
+        };
+        log(`[Summary] Generated for ${lastSessionSummary.sessionId}`);
+
+        if (cdpHandler) {
+            await cdpHandler.pushSummaryResult(targetPageId, {
+                status: 'success',
+                summary: summaryText,
+                generatedAt: lastSessionSummary.generatedAt
+            });
+        }
+
+        if (!options.silent) {
+            vscode.window.showInformationMessage('Auto Accept: Session summary ready.');
+        }
+
+        return lastSessionSummary;
+    } catch (e) {
+        log(`[Summary] Failed: ${e.message}`);
+        if (cdpHandler) {
+            await cdpHandler.pushSummaryResult(targetPageId, {
+                status: 'error',
+                error: 'Failed to generate summary. Please try again.'
+            });
+        }
+        if (!options.silent) {
+            vscode.window.showErrorMessage(`Auto Accept: ${e.message}`);
+        }
+        throw e;
+    } finally {
+        summaryRequestInFlight = false;
+    }
+}
+
+async function checkForSummaryRequests(context) {
+    if (!isEnabled || backgroundModeEnabled || !cdpHandler || summaryRequestInFlight) return;
+
+    try {
+        const requests = await cdpHandler.consumeSummaryRequests();
+        if (!Array.isArray(requests) || requests.length === 0) return;
+
+        const primary = requests[0];
+        const result = await generateSessionSummary(context, {
+            pageId: primary.id,
+            source: 'overlay',
+            silent: true
+        });
+
+        for (let i = 1; i < requests.length; i++) {
+            await cdpHandler.pushSummaryResult(requests[i].id, {
+                status: 'success',
+                summary: result?.summary || '',
+                generatedAt: result?.generatedAt || new Date().toISOString()
+            });
+        }
+    } catch (e) {
+        log(`[Summary] Request processing error: ${e.message}`);
+    }
+}
+
 async function activate(context) {
     globalContext = context;
     console.log('Auto Accept Extension: Activator called.');
-
-    // Initialize payment handler
-    payment.init(context);
-    payment.setCallbacks({
-        log,
-        onProActivated: async () => {
-            // Update CDP handler if running
-            if (cdpHandler && cdpHandler.setProStatus) {
-                cdpHandler.setProStatus(true);
-            }
-
-            pollFrequency = payment.getPollFrequency();
-
-            // Sync sessions with new pro status
-            if (isEnabled) {
-                await syncSessions();
-            }
-
-            updateStatusBar();
-            await handlePaidActivation(context);
-        }
-    });
 
     // CRITICAL: Create status bar items FIRST before anything else
     try {
@@ -155,9 +325,10 @@ async function activate(context) {
     try {
         // 1. Initialize State
         isEnabled = context.globalState.get(GLOBAL_STATE_KEY, false);
+        isPro = context.globalState.get(PRO_STATE_KEY, false);
 
-        // Load frequency - Pro/trial users get custom, free users get 300ms
-        pollFrequency = payment.getPollFrequency();
+        // Load frequency
+        pollFrequency = context.globalState.get(FREQ_STATE_KEY, 1000);
 
         // Load background mode state
         backgroundModeEnabled = context.globalState.get(BACKGROUND_MODE_KEY, false);
@@ -180,26 +351,24 @@ async function activate(context) {
 
 
         // 1.5 Verify License Background Check
-        payment.verifyLicense().then(isValid => {
-            if (payment.isPro() !== isValid) {
-                payment.setProStatus(isValid);
+        verifyLicense(context).then(isValid => {
+            // null = network/parse error — preserve current Pro status
+            if (isValid === null) {
+                log('License re-verification: Network error, preserving current Pro status');
+                return;
+            }
+            if (isPro !== isValid) {
+                isPro = isValid;
+                context.globalState.update(PRO_STATE_KEY, isValid);
                 log(`License re-verification: Updated Pro status to ${isValid}`);
 
                 if (cdpHandler && cdpHandler.setProStatus) {
                     cdpHandler.setProStatus(isValid);
                 }
 
-                if (!isValid && !payment.isTrialActive()) {
-                    pollFrequency = 300; // Downgrade speed for non-trial free users
-                }
                 updateStatusBar();
             }
         });
-
-        // 1.6 Periodic Trial Expiration Check (every hour)
-        setInterval(() => {
-            payment.checkTrialExpiration();
-        }, 60 * 60 * 1000); // Check every hour
 
         currentIDE = detectIDE();
 
@@ -220,6 +389,7 @@ async function activate(context) {
             // When user returns and auto-accept is running, check for away actions
             if (e.focused && isEnabled) {
                 log(`[Away] Window focus detected by VS Code API. Checking for away actions...`);
+                // Wait a tiny bit for CDP to settle after focus state is pushed
                 setTimeout(() => checkForAwayActions(context), 500);
             }
         });
@@ -249,6 +419,18 @@ async function activate(context) {
             vscode.commands.registerCommand('auto-accept.toggleBackground', () => handleBackgroundToggle(context)),
             vscode.commands.registerCommand('auto-accept.updateBannedCommands', (commands) => handleBannedCommandsUpdate(context, commands)),
             vscode.commands.registerCommand('auto-accept.getBannedCommands', () => bannedCommands),
+            vscode.commands.registerCommand('auto-accept.getROIStats', async () => {
+                const stats = await loadROIStats(context);
+                const timeSavedSeconds = stats.clicksThisWeek * SECONDS_PER_CLICK;
+                const timeSavedMinutes = Math.round(timeSavedSeconds / 60);
+                return {
+                    ...stats,
+                    timeSavedMinutes,
+                    timeSavedFormatted: timeSavedMinutes >= 60
+                        ? `${(timeSavedMinutes / 60).toFixed(1)} hours`
+                        : `${timeSavedMinutes} minutes`
+                };
+            }),
             vscode.commands.registerCommand('auto-accept.openSettings', () => {
                 const panel = getSettingsPanel();
                 if (panel) {
@@ -257,7 +439,10 @@ async function activate(context) {
                     vscode.window.showErrorMessage('Failed to load Settings Panel.');
                 }
             }),
-            vscode.commands.registerCommand('auto-accept.activatePro', () => payment.activatePro()),
+            vscode.commands.registerCommand('auto-accept.generateSessionSummary', () =>
+                generateSessionSummary(context, { source: 'command', silent: false })),
+            vscode.commands.registerCommand('auto-accept.getLastSessionSummary', () => lastSessionSummary),
+            vscode.commands.registerCommand('auto-accept.activatePro', () => handleProActivation(context)),
             vscode.commands.registerCommand('auto-accept.onPaid', () => handlePaidActivation(context))
         );
 
@@ -267,7 +452,7 @@ async function activate(context) {
                 log(`URI Handler received: ${uri.toString()}`);
                 if (uri.path === '/activate' || uri.path === 'activate') {
                     log('Activation URI detected - verifying pro status...');
-                    payment.activatePro();
+                    handleProActivation(context);
                 }
             }
         };
@@ -281,11 +466,8 @@ async function activate(context) {
             log(`Error in environment check: ${err.message}`);
         }
 
-        // 8. Show Version 5.0 Notification (Once)
-        showVersionNotification(context);
-
-        // 9. Show Releasy AI Cross-Promo (Once, after first session)
-        showReleasyCrossPromo(context);
+        // 8. Show first-time user guide if new install
+        showFirstTimeGuide(context);
 
         log('Auto Accept: Activation complete');
     } catch (error) {
@@ -317,10 +499,25 @@ async function ensureCDPOrPrompt(showPrompt = false) {
 
 async function checkEnvironmentAndStart() {
     if (isEnabled) {
+        if (!isPro) {
+            log('Auto Accept enabled but license not verified. Disabling until licensed.');
+            isEnabled = false;
+            await globalContext.globalState.update(GLOBAL_STATE_KEY, false);
+            updateStatusBar();
+            return;
+        }
         log('Initializing Auto Accept environment...');
-        // Start polling immediately via commands, CDP connects in background
+
+        // CDP is required for button clicking (webview DOM access)
+        const cdpAvailable = await ensureCDPOrPrompt(true);
+        if (!cdpAvailable) {
+            log('CDP not available. Prompting user for setup.');
+            return;
+        }
+
+        // Start polling (commands + CDP)
         await startPolling();
-        ensureCDPOrPrompt(false); // non-blocking CDP attempt
+        startStatsCollection(globalContext);
     }
     updateStatusBar();
 }
@@ -330,17 +527,16 @@ async function handleToggle(context) {
     log(`  Previous isEnabled: ${isEnabled}`);
 
     try {
-        // Auto-start trial on first toggle for free users
-        if (!isEnabled && !payment.isPro() && !payment.hasTrialStarted()) {
-            payment.startTrial();
+        if (!isEnabled && !isPro) {
             vscode.window.showInformationMessage(
-                '3-day free trial activated! All Pro features are unlocked. Try Auto Accept out by prompting your agent as usual!',
-                'Learn More'
+                'Auto Accept requires an active license.',
+                'Purchase License'
             ).then(choice => {
-                if (choice === 'Learn More') {
+                if (choice === 'Purchase License') {
                     vscode.commands.executeCommand('auto-accept.openSettings');
                 }
             });
+            return;
         }
 
         isEnabled = !isEnabled;
@@ -353,14 +549,34 @@ async function handleToggle(context) {
         log('  Calling updateStatusBar...');
         updateStatusBar();
 
-        // Do CDP operations in background (don't block toggle)
+        // Do CDP operations — required for all IDEs
         if (isEnabled) {
             log('Auto Accept: Enabled');
-            // Start command polling immediately, CDP connects in background
+
+            // CDP is required for button clicking (webview DOM access)
+            const cdpAvailable = await ensureCDPOrPrompt(true);
+            if (!cdpAvailable) {
+                log('CDP not available. Prompting user for setup.');
+                // Keep enabled state so it auto-starts after relaunch
+                return;
+            }
+
             startPolling();
-            ensureCDPOrPrompt(false); // non-blocking CDP attempt
+            startStatsCollection(context);
+            incrementSessionCount(context);
         } else {
             log('Auto Accept: Disabled');
+            markSessionEnded();
+
+            // Fire-and-forget: Show session summary notification (non-blocking)
+            if (cdpHandler) {
+                cdpHandler.getSessionSummary()
+                    .then(summary => showSessionSummaryNotification(context, summary))
+                    .catch(() => { });
+            }
+
+            // Fire-and-forget: collect stats and stop in background
+            collectAndSaveStats(context).catch(() => { });
             stopPolling().catch(() => { });
         }
 
@@ -372,7 +588,7 @@ async function handleToggle(context) {
 }
 
 async function handlePaidActivation(context) {
-    if (!payment.isPro()) {
+    if (!isPro) {
         log('handlePaidActivation called but Pro not verified.');
         return;
     }
@@ -388,20 +604,15 @@ async function handleRelaunch() {
         vscode.window.showErrorMessage('Relauncher not initialized.');
         return;
     }
-    if (!payment.hasProAccess()) {
-        const panel = getSettingsPanel();
-        if (panel) {
-            panel.showUpgradePrompt(globalContext, currentIDE);
-        } else {
-            vscode.window.showInformationMessage(
-                'Upgrade to Pro to unlock Background Mode and browser-based auto-accept.',
-                'Upgrade'
-            ).then(choice => {
-                if (choice === 'Upgrade') {
-                    vscode.commands.executeCommand('auto-accept.openSettings');
-                }
-            });
-        }
+    if (!isPro) {
+        vscode.window.showInformationMessage(
+            'Auto Accept requires an active license.',
+            'Purchase License'
+        ).then(choice => {
+            if (choice === 'Purchase License') {
+                vscode.commands.executeCommand('auto-accept.openSettings');
+            }
+        });
         return;
     }
 
@@ -410,28 +621,17 @@ async function handleRelaunch() {
 }
 
 async function handleFrequencyUpdate(context, freq) {
-    if (!payment.hasProAccess()) {
-        log('Custom frequency requires Pro');
-        return;
-    }
     pollFrequency = freq;
-    await context.globalState.update(payment.FREQ_STATE_KEY, freq);
+    await context.globalState.update(FREQ_STATE_KEY, freq);
     log(`Poll frequency updated to: ${freq}ms`);
     if (isEnabled) {
         await syncSessions();
-        if (commandPollTimer) {
-            clearInterval(commandPollTimer);
-        }
-        commandPollTimer = setInterval(() => {
-            if (!isEnabled) return;
-            executeAcceptCommandsForIDE().catch(() => { });
-        }, pollFrequency);
     }
 }
 
 async function handleBannedCommandsUpdate(context, commands) {
-    if (!payment.hasProAccess()) {
-        log('Banned commands customization requires Pro');
+    if (!isPro) {
+        log('Banned commands customization requires an active license');
         return;
     }
     bannedCommands = Array.isArray(commands) ? commands : [];
@@ -448,14 +648,13 @@ async function handleBannedCommandsUpdate(context, commands) {
 async function handleBackgroundToggle(context) {
     log('Background toggle clicked');
 
-    if (!payment.hasProAccess()) {
+    if (!isPro) {
         vscode.window.showInformationMessage(
-            'Background Mode is a Pro feature.',
-            'Learn More'
+            'Auto Accept requires an active license.',
+            'Purchase License'
         ).then(choice => {
-            if (choice === 'Learn More') {
-                const panel = getSettingsPanel();
-                if (panel) panel.createOrShow(context.extensionUri, context);
+            if (choice === 'Purchase License') {
+                vscode.commands.executeCommand('auto-accept.openSettings');
             }
         });
         return;
@@ -507,10 +706,9 @@ async function handleBackgroundToggle(context) {
         await context.globalState.update(BACKGROUND_MODE_KEY, backgroundModeEnabled);
         log(`Background mode toggled: ${backgroundModeEnabled}`);
 
-        // If background mode is being turned OFF, stop background loops
+        // If background mode is being turned OFF, stop background loops immediately
         if (!backgroundModeEnabled && cdpHandler && isEnabled) {
             log('Background mode OFF: Stopping background loops...');
-
             // Stop current session and restart in simple mode
             await cdpHandler.stop();
             await syncSessions();
@@ -538,7 +736,7 @@ async function syncSessions() {
         log(`CDP: Syncing sessions (Mode: ${backgroundModeEnabled ? 'Background' : 'Simple'})...`);
         try {
             await cdpHandler.start({
-                isPro: payment.hasProAccess(),
+                isPro,
                 isBackgroundMode: backgroundModeEnabled,
                 pollInterval: pollFrequency,
                 ide: currentIDE,
@@ -552,21 +750,13 @@ async function syncSessions() {
 
 async function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
-    if (commandPollTimer) clearInterval(commandPollTimer);
+    ensureSessionStarted();
     log('Auto Accept: Monitoring session...');
 
-    // Initial trigger
+    // Initial CDP sync — injects auto_accept.js which handles all button clicking
     await syncSessions();
-    await executeAcceptCommandsForIDE();
 
-    // IDE command polling (accepts via native commands)
-    // Free users get fixed 300ms; Pro/trial users get custom frequency
-    commandPollTimer = setInterval(() => {
-        if (!isEnabled) return;
-        executeAcceptCommandsForIDE().catch(() => { });
-    }, pollFrequency);
-
-    // Polling now primarily handles the Instance Lock and ensures CDP is active
+    // Periodic polling: instance locking + CDP keep-alive + summary requests
     pollTimer = setInterval(async () => {
         if (!isEnabled) return;
 
@@ -598,6 +788,7 @@ async function startPolling() {
         }
 
         await syncSessions();
+        checkForSummaryRequests(globalContext).catch(() => { });
     }, 5000);
 }
 
@@ -606,14 +797,124 @@ async function stopPolling() {
         clearInterval(pollTimer);
         pollTimer = null;
     }
-    if (commandPollTimer) {
-        clearInterval(commandPollTimer);
-        commandPollTimer = null;
+    if (statsCollectionTimer) {
+        clearInterval(statsCollectionTimer);
+        statsCollectionTimer = null;
     }
     if (cdpHandler) await cdpHandler.stop();
+    markSessionEnded();
     log('Auto Accept: Polling stopped');
 }
 
+// --- ROI Stats Collection ---
+
+function getWeekStart() {
+    const now = new Date();
+    const dayOfWeek = now.getDay(); // 0 = Sunday
+    const diff = now.getDate() - dayOfWeek;
+    const weekStart = new Date(now.setDate(diff));
+    weekStart.setHours(0, 0, 0, 0);
+    return weekStart.getTime();
+}
+
+async function loadROIStats(context) {
+    const defaultStats = {
+        weekStart: getWeekStart(),
+        clicksThisWeek: 0,
+        blockedThisWeek: 0,
+        sessionsThisWeek: 0
+    };
+
+    let stats = context.globalState.get(ROI_STATS_KEY, defaultStats);
+
+    // Check if we need to reset for a new week
+    const currentWeekStart = getWeekStart();
+    if (stats.weekStart !== currentWeekStart) {
+        log(`ROI Stats: New week detected. Showing summary and resetting.`);
+
+        // Show weekly summary notification if there were meaningful stats
+        if (stats.clicksThisWeek > 0) {
+            await showWeeklySummaryNotification(context, stats);
+        }
+
+        // Reset for new week
+        stats = { ...defaultStats, weekStart: currentWeekStart };
+        await context.globalState.update(ROI_STATS_KEY, stats);
+    }
+
+    return stats;
+}
+
+async function showWeeklySummaryNotification(context, lastWeekStats) {
+    const timeSavedSeconds = lastWeekStats.clicksThisWeek * SECONDS_PER_CLICK;
+    const timeSavedMinutes = Math.round(timeSavedSeconds / 60);
+
+    let timeStr;
+    if (timeSavedMinutes >= 60) {
+        timeStr = `${(timeSavedMinutes / 60).toFixed(1)} hours`;
+    } else {
+        timeStr = `${timeSavedMinutes} minutes`;
+    }
+
+    const message = `📊 Last week, Auto Accept saved you ${timeStr} by auto-clicking ${lastWeekStats.clicksThisWeek} buttons!`;
+
+    let detail = '';
+    if (lastWeekStats.sessionsThisWeek > 0) {
+        detail += `Recovered ${lastWeekStats.sessionsThisWeek} stuck sessions. `;
+    }
+    if (lastWeekStats.blockedThisWeek > 0) {
+        detail += `Blocked ${lastWeekStats.blockedThisWeek} dangerous commands.`;
+    }
+
+    const choice = await vscode.window.showInformationMessage(
+        message,
+        { detail: detail.trim() || undefined },
+        'View Details'
+    );
+
+    if (choice === 'View Details') {
+        const panel = getSettingsPanel();
+        if (panel) {
+            panel.createOrShow(context.extensionUri, context);
+        }
+    }
+}
+
+// --- SESSION SUMMARY NOTIFICATION ---
+// Called when user finishes a session (e.g., leaves conversation view)
+async function showSessionSummaryNotification(context, summary) {
+    log(`[Notification] showSessionSummaryNotification called with: ${JSON.stringify(summary)}`);
+    if (!summary || summary.clicks === 0) {
+        log(`[Notification] Session summary skipped: no clicks`);
+        return;
+    }
+    log(`[Notification] Showing session summary for ${summary.clicks} clicks`);
+
+    const lines = [
+        `✅ This session:`,
+        `• ${summary.clicks} actions auto-accepted`,
+        `• ${summary.terminalCommands} terminal commands`,
+        `• ${summary.fileEdits} file edits`,
+        `• ${summary.blocked} interruptions blocked`
+    ];
+
+    if (summary.estimatedTimeSaved) {
+        lines.push(`\n⏱ Estimated time saved: ~${summary.estimatedTimeSaved} minutes`);
+    }
+
+    const message = lines.join('\n');
+
+    vscode.window.showInformationMessage(
+        `🤖 Auto Accept: ${summary.clicks} actions handled this session`,
+        { detail: message },
+        'View Stats'
+    ).then(choice => {
+        if (choice === 'View Stats') {
+            const panel = getSettingsPanel();
+            if (panel) panel.createOrShow(context.extensionUri, context);
+        }
+    });
+}
 
 // --- "AWAY" ACTIONS NOTIFICATION ---
 // Called when user returns after window was minimized/unfocused
@@ -625,7 +926,7 @@ async function showAwayActionsNotification(context, actionsCount) {
     }
     log(`[Notification] Showing away actions notification for ${actionsCount} actions`);
 
-    const message = `Auto Accept handled ${actionsCount} action${actionsCount > 1 ? 's' : ''} while you were away.`;
+    const message = `🚀 Auto Accept handled ${actionsCount} action${actionsCount > 1 ? 's' : ''} while you were away.`;
     const detail = `Agents stayed autonomous while you focused elsewhere.`;
 
     vscode.window.showInformationMessage(
@@ -638,34 +939,6 @@ async function showAwayActionsNotification(context, actionsCount) {
             if (panel) panel.createOrShow(context.extensionUri, context);
         }
     });
-}
-
-// --- BACKGROUND MODE UPSELL ---
-// Called when free user switches tabs (could have been auto-handled)
-async function showBackgroundModeUpsell(context) {
-    if (payment.isPro()) return; // Already Pro, no upsell
-
-    const UPSELL_COOLDOWN_KEY = 'auto-accept-bg-upsell-last';
-    const UPSELL_COOLDOWN_MS = 1000 * 60 * 30; // 30 minutes between upsells
-
-    const lastUpsell = context.globalState.get(UPSELL_COOLDOWN_KEY, 0);
-    const now = Date.now();
-
-    if (now - lastUpsell < UPSELL_COOLDOWN_MS) return; // Too soon
-
-    await context.globalState.update(UPSELL_COOLDOWN_KEY, now);
-
-    const choice = await vscode.window.showInformationMessage(
-        `Auto Accept could've handled this tab switch automatically.`,
-        { detail: 'Enable Background Mode to keep all your agents moving in parallel—no manual tab switching needed.' },
-        'Enable Background Mode',
-        'Not Now'
-    );
-
-    if (choice === 'Enable Background Mode') {
-        const panel = getSettingsPanel();
-        if (panel) panel.createOrShow(context.extensionUri, context);
-    }
 }
 
 // --- AWAY MODE POLLING ---
@@ -693,6 +966,47 @@ async function checkForAwayActions(context) {
     }
 }
 
+async function collectAndSaveStats(context) {
+    if (!cdpHandler) return;
+
+    try {
+        // Get stats from browser and reset them
+        const browserStats = await cdpHandler.resetStats();
+
+        if (browserStats.clicks > 0 || browserStats.blocked > 0) {
+            const currentStats = await loadROIStats(context);
+            currentStats.clicksThisWeek += browserStats.clicks;
+            currentStats.blockedThisWeek += browserStats.blocked;
+
+            await context.globalState.update(ROI_STATS_KEY, currentStats);
+            log(`ROI Stats collected: +${browserStats.clicks} clicks, +${browserStats.blocked} blocked (Total: ${currentStats.clicksThisWeek} clicks, ${currentStats.blockedThisWeek} blocked)`);
+        }
+    } catch (e) {
+        // Silently fail - stats collection should not interrupt normal operation
+    }
+}
+
+async function incrementSessionCount(context) {
+    const stats = await loadROIStats(context);
+    stats.sessionsThisWeek++;
+    await context.globalState.update(ROI_STATS_KEY, stats);
+    log(`ROI Stats: Session count incremented to ${stats.sessionsThisWeek}`);
+}
+
+function startStatsCollection(context) {
+    if (statsCollectionTimer) clearInterval(statsCollectionTimer);
+
+    // Collect stats every 30 seconds and check for away actions
+    statsCollectionTimer = setInterval(() => {
+        if (isEnabled) {
+            collectAndSaveStats(context);
+            checkForAwayActions(context); // Check if user returned from away
+        }
+    }, 30000);
+
+    log('ROI Stats: Collection started (every 30s)');
+}
+
 
 function updateStatusBar() {
     if (!statusBarItem) return;
@@ -713,13 +1027,6 @@ function updateStatusBar() {
             statusText = 'PAUSED (Multi-window)';
             bgColor = new vscode.ThemeColor('statusBarItem.warningBackground');
             icon = '$(sync~spin)';
-        }
-
-        // Show trial countdown in status bar
-        if (!payment.isPro() && payment.isTrialActive()) {
-            const daysLeft = payment.getTrialDaysLeft();
-            statusText += ` (Trial: ${daysLeft}d left)`;
-            tooltip += ` | Pro Trial: ${daysLeft} day(s) remaining`;
         }
 
         statusBarItem.text = `${icon} Auto Accept: ${statusText}`;
@@ -752,137 +1059,256 @@ function updateStatusBar() {
     }
 }
 
-// Re-implement checkInstanceLock correctly with context
-async function checkInstanceLock() {
-    if (payment.isPro()) return true;
-    if (!globalContext) return true; // Should not happen
+async function verifyLicense(context, retries = 3) {
+    const userId = context.globalState.get('auto-accept-userId');
+    if (!userId) return false;
 
-    const lockId = globalContext.globalState.get(LOCK_KEY);
-    const lastHeartbeat = globalContext.globalState.get(HEARTBEAT_KEY, 0);
-    const now = Date.now();
-
-    // 1. If no lock or lock is stale (>10s), claim it
-    if (!lockId || (now - lastHeartbeat > 10000)) {
-        await globalContext.globalState.update(LOCK_KEY, INSTANCE_ID);
-        await globalContext.globalState.update(HEARTBEAT_KEY, now);
-        return true;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const result = await new Promise((resolve, reject) => {
+                const req = https.get(`${LICENSE_API}/check-license?userId=${userId}`, { timeout: 5000 }, (res) => {
+                    let data = '';
+                    res.on('data', chunk => data += chunk);
+                    res.on('end', () => {
+                        try {
+                            const json = JSON.parse(data);
+                            resolve(json.isPro === true);
+                        } catch (e) {
+                            reject(new Error('Invalid JSON'));
+                        }
+                    });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+            });
+            // Cache verification timestamp on success
+            await context.globalState.update('auto-accept-last-verified', Date.now());
+            return result;
+        } catch (e) {
+            log(`License verification attempt ${attempt}/${retries} failed: ${e.message}`);
+            if (attempt < retries) {
+                await new Promise(r => setTimeout(r, 1000 * attempt)); // backoff: 1s, 2s, 3s
+            }
+        }
     }
-
-    // 2. If we own the lock, update heartbeat
-    if (lockId === INSTANCE_ID) {
-        await globalContext.globalState.update(HEARTBEAT_KEY, now);
-        return true;
+    // All retries failed — check if we verified recently (within 24h)
+    const lastVerified = context.globalState.get('auto-accept-last-verified', 0);
+    if (Date.now() - lastVerified < 24 * 60 * 60 * 1000) {
+        log('License verification: Network error, but verified within 24h. Preserving status.');
+        return null; // preserve current status
     }
-
-    // 3. Someone else owns the lock and it's fresh
-    return false;
+    log('License verification: Network error and stale cache. Returning null.');
+    return null;
 }
 
-async function showVersionNotification(context) {
-    // Check if 8.6.0 notification has been shown
-    const hasShown8_6 = context.globalState.get(VERSION_8_6_0_KEY, false);
-    if (!hasShown8_6) {
-        // Show 8.6.0 notification
-        const title = "What's new in Auto Accept 8.6.0";
-        const body = `Simpler setup. More control.
+// Handle Pro activation (called from URI handler or command)
+async function handleProActivation(context) {
+    log('Pro Activation: Starting verification process...');
 
-Manual CDP Setup — Platform-specific scripts give you full control over shortcut configuration
+    // Show progress notification
+    vscode.window.withProgress(
+        {
+            location: vscode.ProgressLocation.Notification,
+            title: 'Auto Accept: Verifying Pro status...',
+            cancellable: false
+        },
+        async (progress) => {
+            progress.report({ increment: 30 });
 
-Copy-to-Clipboard — Easy script transfer to your terminal
+            // Give webhook a moment to process (Stripe webhooks can have slight delay)
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            progress.report({ increment: 30 });
 
-Platform Support — Windows PowerShell, macOS Terminal, and Linux Bash scripts
+            // Verify license
+            const isProNow = await verifyLicense(context);
+            progress.report({ increment: 40 });
 
-Enhanced Security — No automatic file modification, you run scripts when ready
+            if (isProNow) {
+                // Update state
+                isPro = true;
+                await context.globalState.update(PRO_STATE_KEY, true);
 
-Same Great Features — All the Auto Accept functionality you love, now with clearer setup`;
-        const btnDashboard = "View Dashboard";
-        const btnGotIt = "Got it";
+                // Update CDP handler if running
+                if (cdpHandler && cdpHandler.setProStatus) {
+                    cdpHandler.setProStatus(true);
+                }
 
-        // Mark as shown immediately to prevent loops/multiple showings
-        await context.globalState.update(VERSION_8_6_0_KEY, true);
+                // Update poll frequency to pro default
+                pollFrequency = context.globalState.get(FREQ_STATE_KEY, 1000);
 
-        const selection = await vscode.window.showInformationMessage(
-            `${title}\n\n${body}`,
-            { modal: true },
-            btnGotIt,
-            btnDashboard
-        );
+                // Sync sessions with new pro status
+                if (isEnabled) {
+                    await syncSessions();
+                }
 
-        if (selection === btnDashboard) {
-            const panel = getSettingsPanel();
-            if (panel) panel.createOrShow(context.extensionUri, context);
+                // Update UI
+                updateStatusBar();
+
+                await handlePaidActivation(context);
+
+                log('Pro Activation: SUCCESS - User is now Pro!');
+                vscode.window.showInformationMessage(
+                    '🎉 Pro Activated! Thank you for your support. All Pro features are now unlocked.',
+                    'Open Dashboard'
+                ).then(choice => {
+                    if (choice === 'Open Dashboard') {
+                        const panel = getSettingsPanel();
+                        if (panel) panel.createOrShow(context.extensionUri, context);
+                    }
+                });
+            } else {
+                log('Pro Activation: License not found yet. Starting background polling...');
+                // Start background polling in case webhook is delayed
+                startProPolling(context);
+            }
+        }
+    );
+}
+
+// Background polling for delayed webhook scenarios
+let proPollingTimer = null;
+let proPollingAttempts = 0;
+const MAX_PRO_POLLING_ATTEMPTS = 24; // 2 minutes (5s intervals)
+
+function startProPolling(context) {
+    if (proPollingTimer) {
+        clearInterval(proPollingTimer);
+    }
+
+    proPollingAttempts = 0;
+    log('Pro Polling: Starting background verification (checking every 5s for up to 2 minutes)...');
+
+    vscode.window.showInformationMessage(
+        'Payment received! Verifying your Pro status... This may take a moment.'
+    );
+
+    proPollingTimer = setInterval(async () => {
+        proPollingAttempts++;
+        log(`Pro Polling: Attempt ${proPollingAttempts}/${MAX_PRO_POLLING_ATTEMPTS}`);
+
+        if (proPollingAttempts > MAX_PRO_POLLING_ATTEMPTS) {
+            clearInterval(proPollingTimer);
+            proPollingTimer = null;
+            log('Pro Polling: Max attempts reached. User should check manually.');
+            vscode.window.showWarningMessage(
+                'Pro verification is taking longer than expected. Please click "Check Pro Status" in settings, or contact support if the issue persists.',
+                'Open Settings'
+            ).then(choice => {
+                if (choice === 'Open Settings') {
+                    const panel = getSettingsPanel();
+                    if (panel) panel.createOrShow(context.extensionUri, context);
+                }
+            });
+            return;
+        }
+
+        const isProNow = await verifyLicense(context);
+        if (isProNow) {
+            clearInterval(proPollingTimer);
+            proPollingTimer = null;
+
+            // Update state
+            isPro = true;
+            await context.globalState.update(PRO_STATE_KEY, true);
+
+            if (cdpHandler && cdpHandler.setProStatus) {
+                cdpHandler.setProStatus(true);
+            }
+
+            pollFrequency = context.globalState.get(FREQ_STATE_KEY, 1000);
+
+            if (isEnabled) {
+                await syncSessions();
+            }
+
+            updateStatusBar();
+
+            await handlePaidActivation(context);
+
+            log('Pro Polling: SUCCESS - Pro status confirmed!');
+            vscode.window.showInformationMessage(
+                '🎉 Pro Activated! Thank you for your support. All Pro features are now unlocked.',
+                'Open Dashboard'
+            ).then(choice => {
+                if (choice === 'Open Dashboard') {
+                    const panel = getSettingsPanel();
+                    if (panel) panel.createOrShow(context.extensionUri, context);
+                }
+            });
+        }
+    }, 5000);
+}
+
+async function showFirstTimeGuide(context) {
+    const hasCompletedSetup = context.globalState.get(FIRST_INSTALL_KEY, false);
+    if (hasCompletedSetup) return;
+
+    // Mark immediately to prevent showing again on re-activation
+    await context.globalState.update(FIRST_INSTALL_KEY, true);
+
+    log('First install detected. Showing user guide...');
+
+    // Step 1: Welcome + feature overview
+    const welcomeChoice = await vscode.window.showInformationMessage(
+        'Welcome to Auto Accept! Let\'s get you set up in 2 quick steps.',
+        { modal: true },
+        'Get Started',
+        'Skip Setup'
+    );
+
+    if (welcomeChoice === 'Skip Setup') return;
+
+    // Step 2: CDP Setup
+    const cdpAvailable = await ensureCDPOrPrompt(false);
+    if (!cdpAvailable) {
+        log('FTUE: CDP not available, prompting setup...');
+        if (relauncher) {
+            await relauncher.ensureCDPAndRelaunch();
+        }
+        // After setup panel is shown, payment prompt will come when they toggle on
+        return;
+    }
+
+    // Step 3: Payment (only if not already pro)
+    if (!isPro) {
+        log('FTUE: CDP ready but no license. Showing payment prompt...');
+        const panel = getSettingsPanel();
+        if (panel) {
+            panel.createOrShow(context.extensionUri, context, 'prompt');
         }
         return;
     }
 
-    // Legacy: Check if 7.0 notification has been shown (for backward compatibility)
-    const hasShown7_0 = context.globalState.get(VERSION_7_0_KEY, false);
-    if (hasShown7_0) return;
+    // Already paid + CDP ready = show quick feature guide
+    await showFeatureGuide(context);
+}
 
-    // Show 7.0 notification (only for users who haven't seen any notification)
-    const title = "What's new in Auto Accept 7.0";
-    const body = `Smarter. Faster. More reliable.
+async function showFeatureGuide(context) {
+    const guide = [
+        '📋 Quick Guide:\n\n' +
+        '• Click "Auto Accept: OFF" in the status bar to toggle ON\n' +
+        '• Click the ⚙️ icon for settings (polling speed, banned commands)\n' +
+        '• Click "Background: OFF" to enable multi-tab mode\n\n' +
+        'Auto Accept clicks accept/run/retry buttons for you automatically.\n' +
+        'Dangerous commands (rm -rf, format, etc.) are blocked by default.'
+    ];
 
-Smart Away Notifications — Get notified only when actions happened while you were truly away.
-
-Session Insights — See exactly what happened when you turn off Auto Accept: file edits, terminal commands, and blocked interruptions.
-
-Improved Background Mode — Faster, more reliable multi-chat handling.
-
-Enhanced Stability — Complete analytics rewrite for rock-solid tracking.`;
-    const btnDashboard = "View Dashboard";
-    const btnGotIt = "Got it";
-
-    // Mark as shown immediately to prevent loops/multiple showings
-    await context.globalState.update(VERSION_7_0_KEY, true);
-
-    const selection = await vscode.window.showInformationMessage(
-        `${title}\n\n${body}`,
+    const choice = await vscode.window.showInformationMessage(
+        guide[0],
         { modal: true },
-        btnGotIt,
-        btnDashboard
+        'Open Settings',
+        'Got it'
     );
 
-    if (selection === btnDashboard) {
+    if (choice === 'Open Settings') {
         const panel = getSettingsPanel();
         if (panel) panel.createOrShow(context.extensionUri, context);
     }
 }
 
-async function showReleasyCrossPromo(context) {
-    const hasShown = context.globalState.get(RELEASY_PROMO_KEY, false);
-    if (hasShown) return;
-
-    // Mark as shown immediately to prevent multiple showings
-    await context.globalState.update(RELEASY_PROMO_KEY, true);
-
-    const title = "New from the Auto Accept team";
-    const body = `Releasy AI — Marketing for Developers
-
-Turn your GitHub commits into Reddit posts automatically.
-
-- AI analyzes your changes
-- Generates engaging posts
-- Auto-publishes to Reddit
-
-Zero effort marketing for your side projects.`;
-
-    const selection = await vscode.window.showInformationMessage(
-        `${title}\n\n${body}`,
-        { modal: true },
-        "Check it out",
-        "Maybe later"
-    );
-
-    if (selection === "Check it out") {
-        vscode.env.openExternal(
-            vscode.Uri.parse('https://releasyai.com?utm_source=auto-accept&utm_medium=extension&utm_campaign=version_promo')
-        );
-    }
-}
-
 function deactivate() {
     stopPolling();
+    markSessionEnded();
     if (cdpHandler) {
         cdpHandler.stop();
     }
