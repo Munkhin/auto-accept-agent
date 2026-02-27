@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# Linux script to add --remote-debugging-port=9000 to Cursor or Antigravity desktop shortcuts
+# Run this script in a terminal, then close and restart your IDE.
+
+IDE_NAME="Cursor"  # Change to "Antigravity" if needed
+IDE_NAME_LOWER=$(echo "$IDE_NAME" | tr '[:upper:]' '[:lower:]')
+
+echo "Looking for $IDE_NAME desktop shortcuts..."
+
+# Function to modify a .desktop file
+modify_desktop_file() {
+    local desktop_file="$1"
+    local backup_file="${desktop_file}.bak"
+    
+    # Create backup
+    cp "$desktop_file" "$backup_file"
+    echo "Backup created: $backup_file"
+    
+    # Check if flag already exists
+    if grep -q "--remote-debugging-port=9000" "$desktop_file"; then
+        echo "Flag already present in $desktop_file"
+        return 0
+    fi
+    
+    # Add flag to Exec line
+    sed -i 's|^Exec=.*|& --remote-debugging-port=9000|' "$desktop_file"
+    
+    # Also add flag to TryExec if present
+    if grep -q "^TryExec=" "$desktop_file"; then
+        sed -i 's|^TryExec=.*|& --remote-debugging-port=9000|' "$desktop_file"
+    fi
+    
+    echo "Modified $desktop_file"
+    return 0
+}
+
+# Search for .desktop files in common locations
+DESKTOP_DIRS=(
+    "$HOME/.local/share/applications"
+    "/usr/share/applications"
+    "/usr/local/share/applications"
+)
+
+modified=false
+for dir in "${DESKTOP_DIRS[@]}"; do
+    if [ -d "$dir" ]; then
+        for file in "$dir"/*.desktop; do
+            if [ -f "$file" ]; then
+                if grep -qi "$IDE_NAME_LOWER" "$file" || grep -qi "cursor" "$file"; then
+                    echo "Found: $file"
+                    modify_desktop_file "$file"
+                    modified=true
+                fi
+            fi
+        done
+    fi
+done
+
+if [ "$modified" = false ]; then
+    echo "No $IDE_NAME desktop shortcut found. You may need to create one manually."
+    echo "Create a .desktop file in ~/.local/share/applications/ with the following content:"
+    echo ""
+    echo "[Desktop Entry]"
+    echo "Version=1.0"
+    echo "Type=Application"
+    echo "Name=$IDE_NAME"
+    echo "Comment=$IDE_NAME IDE"
+    echo "Exec=/path/to/$IDE_NAME --remote-debugging-port=9000"
+    echo "Icon=/path/to/icon.png"
+    echo "Terminal=false"
+    echo "Categories=Development;IDE;"
+    echo ""
+    echo "Replace /path/to/$IDE_NAME with the actual executable path."
+fi
+
+echo ""
+echo "Script completed. Please close and restart $IDE_NAME."

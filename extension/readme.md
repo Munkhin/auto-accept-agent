@@ -45,7 +45,7 @@ Visual indicators show conversation state:
 
 ### Cursor Support
 
-![Cursor background mode](media/cursor.png)
+![Cursor background mode](https://github.com/MunKhin/auto-accept-agent/raw/HEAD/media/cursor.png)
 
 ---
 

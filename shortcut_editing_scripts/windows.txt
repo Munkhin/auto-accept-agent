@@ -1,0 +1,25 @@
+$WshShell = New-Object -ComObject WScript.Shell
+$DesktopPath = [System.IO.Path]::Combine($env:USERPROFILE, "Desktop")
+$Shortcuts = Get-ChildItem "$DesktopPath\*.lnk" | Where-Object { $_.Name -like "*Antigravity*" }
+
+if ($Shortcuts.Count -eq 0) {
+Write-Host "No Antigravity shortcut found on Desktop. Creating a new one..." -ForegroundColor Yellow
+$ShortcutPath = "$DesktopPath\Antigravity.lnk"
+$Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+$Shortcut.TargetPath = "C:\Users\$env:USERNAME\AppData\Local\Programs\Antigravity\Antigravity.exe"
+$Shortcut.Arguments = "--remote-debugging-port=9000 --disable-gpu-driver-bug-workarounds --ignore-gpu-blacklist"
+$Shortcut.Save()
+Write-Host "Created new shortcut: $ShortcutPath" -ForegroundColor Green
+} else {
+foreach ($ShortcutFile in $Shortcuts) {
+$Shortcut = $WshShell.CreateShortcut($ShortcutFile.FullName)
+$Args = $Shortcut.Arguments
+if ($Args -match "--remote-debugging-port=\d+") {
+$Shortcut.Arguments = $Args -replace "--remote-debugging-port=\d+", "--remote-debugging-port=9000"
+} else {
+$Shortcut.Arguments = "--remote-debugging-port=9000 " + $Args
+}
+$Shortcut.Save()
+Write-Host "Updated $($ShortcutFile.Name) to port 9000" -ForegroundColor Green
+}
+}

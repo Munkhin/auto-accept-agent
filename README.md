@@ -1,41 +1,31 @@
-# Auto Accept for Antigravity
+# Auto Accept Agent
 
-## Run 3 AI agents in parallel. Zero babysitting.
+*Disclaimer: This extension is paid. Lesser alternatives are available with less functionality and may not work with newer versions of Antigravity/Cursor*
 
-Stop watching tabs. Auto Accept keeps every Antigravity and Cursor conversation moving — accepting file edits, terminal commands, and recovery prompts automatically.
+## The only Auto Accept that works. Achieve more in less time.
 
----
+Agent nagging at you for terminal commands when you literally turned on allow all?
+Browser agent stuck at "waiting for approval"?
 
-![background mode](https://raw.githubusercontent.com/MunKhin/auto-accept-agent/master/extension/media/background-mode.png)
+No more monitoring agents to approve file changes, terminal commands, browser agents ...
 
----
+Auto accept them all.
 
-## Why Auto Accept?
+## Smoothly run multiple conversations at the same time - Background mode
 
-Antigravity and Cursor's multi-agent workflow is powerful, but it stops every time the agent needs approval. 
+Auto accept agent switches tabs for you and accepts all background requests.
 
-**That's dozens of interruptions per hour.**
-
-Auto Accept eliminates the wait:
-- ✅ **File edits** — Auto-applied
-- ✅ **Terminal commands** — Auto-executed
-- ✅ **Retry prompts** — Auto-confirmed
-- ✅ **Stuck agents** — Auto-recovered
+![background mode](https://github.com/Munkhin/auto-accept-agent/blob/e6bca34225db354a4de64a5d0b8d4cd32d5b7fef/extension/media/background-mode.png)
 
 ---
 
-## Features
-
-### Background Mode
-Run multiple tabs simultaneously. Every conversation auto-accepts in the background — no tab-switching required.
+## MORE Features
 
 ### Dangerous Command Blocking
 Built-in protection against destructive commands like `rm -rf /`. Fully customizable.
 
-### Real-time Status Overlay
-Visual indicators show conversation state:
-- **Purple** — In progress, actively polling
-- **Green** — Task completed
+### Clicking frequency adjusting
+Adjust the clicking frequency of the auto accept agent to finish tasks faster or save your battery.
 
 ### Works Everywhere
 - ✅ Antigravity
@@ -44,6 +34,10 @@ Visual indicators show conversation state:
 - ✅ Minimized/unfocused ide window
 
 ---
+
+## Bug reports 
+
+Contact me at munkhin@releasyai.com or open an issue at https://github.com/Munkhin/auto-accept-agent. I'll reply in 1-2 days.
 
 ## Quick Start
 

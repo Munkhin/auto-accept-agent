@@ -36,6 +36,7 @@ class Relauncher {
     async ensureCDPAndRelaunch() {
         this.log('Checking if current process has CDP flag...');
         const hasFlag = await this.checkShortcutFlag();
+        const ideName = this.getIdeName();
 
         if (hasFlag) {
             this.log('CDP flag present but port inactive. Prompting for restart.');
@@ -51,7 +52,6 @@ class Relauncher {
         }
 
         this.log('CDP flag missing in current process. Showing platform-specific script...');
-        const ideName = this.getIdeName();
         const { script, instructions } = await this.getPlatformScriptAndInstructions();
 
         if (!script) {
@@ -192,8 +192,11 @@ Write-Host "Please restart ${ideName} completely for changes to take effect." -F
                 instructions: `1. Open PowerShell as Administrator\n2. Copy the script above and paste it into PowerShell\n3. Press Enter to run\n4. After the script completes, close and restart ${ideName} completely.`
             };
         } else if (platform === 'darwin') {
+            // NOTE: This script creates a launch wrapper instead of modifying Info.plist.
+            // Modifying Info.plist breaks macOS code signing (Gatekeeper will flag the app).
             const script = `#!/bin/bash
-# Universal macOS Script - Adds CDP Port to ${ideName}
+# macOS CDP Setup for ${ideName}
+# Creates a launch wrapper — does NOT modify the app bundle (preserves code signing).
 
 echo "=== ${ideName} CDP Setup ==="
 echo ""
@@ -227,46 +230,42 @@ if [ -z "\$app_path" ]; then
     exit 1
 fi
 
-info_plist="\$app_path/Contents/Info.plist"
-
-if [ ! -f "\$info_plist" ]; then
-    echo "ERROR: Info.plist not found at expected location."
-    exit 1
-fi
-
 echo ""
-echo "Checking Info.plist: \$info_plist"
 
-# Check if CDP port already exists
-if grep -q "remote-debugging-port" "\$info_plist"; then
-    echo "CDP port already configured in Info.plist"
+# Create a Desktop launcher (.command file — double-click to launch)
+wrapper_path="\$HOME/Desktop/\${IDE_NAME}-CDP.command"
+
+# Write the launcher script
+echo '#!/bin/bash' > "\$wrapper_path"
+echo "open -n -a \\"\$app_path\\" --args --remote-debugging-port=9000" >> "\$wrapper_path"
+chmod +x "\$wrapper_path"
+echo "Created Desktop launcher: \$wrapper_path"
+
+# Add shell alias to .zshrc (default macOS shell)
+shell_rc="\$HOME/.zshrc"
+alias_name=\$(echo "\$IDE_NAME" | tr '[:upper:]' '[:lower:]')-cdp
+
+if [ -f "\$shell_rc" ] && grep -q "\$alias_name" "\$shell_rc"; then
+    echo "Shell alias '\$alias_name' already exists in \$shell_rc"
 else
-    # Create backup
-    backup_plist="\${info_plist}.bak"
-    cp "\$info_plist" "\$backup_plist"
-    echo "Backup created: \$backup_plist"
-
-    # Add CDP port configuration
-    # Insert before closing </dict> tag
-    sed -i '' '/<\\/dict>/i\\
-    <key>LSArguments<\\/key>\\
-    <array>\\
-        <string>--remote-debugging-port=9000<\\/string>\\
-    <\\/array>
-' "\$info_plist"
-
-    echo "CDP port added to Info.plist"
+    echo "" >> "\$shell_rc"
+    echo "# Auto Accept — launch \$IDE_NAME with CDP" >> "\$shell_rc"
+    echo "alias \$alias_name='open -n -a \\"\$app_path\\" --args --remote-debugging-port=9000'" >> "\$shell_rc"
+    echo "Added shell alias '\$alias_name' to \$shell_rc"
 fi
 
 echo ""
 echo "=== Setup Complete ==="
-echo "Please quit and restart ${ideName} completely for changes to take effect."
 echo ""
-echo "To launch with CDP flag temporarily, you can also use:"
-echo "  open -n -a \\"${ideName}\\" --args --remote-debugging-port=9000"`;
+echo "Launch ${ideName} with CDP enabled using ONE of these methods:"
+echo "  1. Double-click '\${IDE_NAME}-CDP.command' on your Desktop"
+echo "  2. Open a new Terminal and type: \$alias_name"
+echo "  3. Run: open -n -a \\"${ideName}\\" --args --remote-debugging-port=9000"
+echo ""
+echo "NOTE: The Dock icon launches WITHOUT CDP. Always use one of the methods above."`;
             return {
                 script,
-                instructions: `1. Open Terminal\n2. Copy the script above and paste it into Terminal\n3. Press Enter to run\n4. After the script completes, quit and restart ${ideName} completely.`
+                instructions: `1. Open Terminal\n2. Paste the script and press Enter\n3. Use the new Desktop launcher or terminal alias to start ${ideName} with CDP\n4. Always launch via the wrapper — the Dock icon does not enable CDP.`
             };
         } else if (platform === 'linux') {
             const script = `#!/bin/bash

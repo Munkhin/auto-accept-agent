@@ -127,7 +127,7 @@ class CDPHandler {
         const conn = this.connections.get(id);
         if (!conn) return;
 
-        const mode = (config.isBackgroundMode && config.isPro) ? 'background' : 'simple';
+        const mode = config.isBackgroundMode ? 'background' : 'simple';
 
         try {
             // Step 1: Inject script if not already injected
@@ -149,7 +149,9 @@ class CDPHandler {
             if (conn.mode !== mode) {
                 const configJson = JSON.stringify({
                     ide: config.ide,
-                    isBackgroundMode: mode === 'background'
+                    isBackgroundMode: mode === 'background',
+                    pollInterval: config.pollInterval || 1000,
+                    bannedCommands: config.bannedCommands || []
                 });
                 this.log(`Calling __autoAcceptStart on ${id} with ${configJson}`);
                 await this._evaluate(id, `if(window.__autoAcceptStart) window.__autoAcceptStart(${configJson})`);
@@ -186,6 +188,88 @@ class CDPHandler {
         });
     }
 
+    _parseJsonResult(res, fallback = null) {
+        const value = res?.result?.value;
+        if (typeof value !== 'string') return fallback;
+        try {
+            return JSON.parse(value);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    async getStats() {
+        const stats = { clicks: 0, blocked: 0, fileEdits: 0, terminalCommands: 0 };
+        for (const [id] of this.connections) {
+            try {
+                const res = await this._evaluate(id, 'JSON.stringify(window.__autoAcceptGetStats ? window.__autoAcceptGetStats() : {})');
+                if (res?.result?.value) {
+                    const s = JSON.parse(res.result.value);
+                    stats.clicks += s.clicks || 0;
+                    stats.blocked += s.blocked || 0;
+                    stats.fileEdits += s.fileEdits || 0;
+                    stats.terminalCommands += s.terminalCommands || 0;
+                }
+            } catch (e) { }
+        }
+        return stats;
+    }
+
+    async getSessionSummary() { return this.getStats(); }
+    async consumeSummaryRequests() {
+        const requests = [];
+        for (const [id] of this.connections) {
+            try {
+                const res = await this._evaluate(id, 'JSON.stringify(window.__autoAcceptConsumeSummaryRequest ? window.__autoAcceptConsumeSummaryRequest() : { requested: false })');
+                const payload = this._parseJsonResult(res, { requested: false });
+                if (payload && payload.requested) {
+                    requests.push({
+                        id,
+                        requestedAt: payload.requestedAt || Date.now()
+                    });
+                }
+            } catch (e) { }
+        }
+        return requests;
+    }
+
+    async getVisibleConversationText(preferredId = null, maxChars = 12000) {
+        const ids = [];
+        if (preferredId && this.connections.has(preferredId)) {
+            ids.push(preferredId);
+        }
+        for (const id of this.connections.keys()) {
+            if (id !== preferredId) ids.push(id);
+        }
+
+        let best = '';
+        for (const id of ids) {
+            try {
+                const res = await this._evaluate(id, `JSON.stringify(window.__autoAcceptGetVisibleConversationText ? window.__autoAcceptGetVisibleConversationText(${maxChars}) : "")`);
+                const text = this._parseJsonResult(res, '');
+                if (typeof text === 'string' && text.trim().length > best.length) {
+                    best = text.trim();
+                }
+                if (best.length >= maxChars) break;
+            } catch (e) { }
+        }
+
+        return best;
+    }
+
+    async pushSummaryResult(pageId, payload) {
+        const expression = `if(window.__autoAcceptSetSummaryResult) window.__autoAcceptSetSummaryResult(${JSON.stringify(payload || {})})`;
+        const ids = pageId && this.connections.has(pageId)
+            ? [pageId]
+            : Array.from(this.connections.keys());
+
+        for (const id of ids) {
+            try {
+                await this._evaluate(id, expression);
+            } catch (e) { }
+        }
+    }
+
     async setFocusState(isFocused) {
         for (const [id] of this.connections) {
             try {
@@ -196,6 +280,7 @@ class CDPHandler {
 
     getConnectionCount() { return this.connections.size; }
     async getAwayActions() { return 0; }
+    async resetStats() { return { clicks: 0, blocked: 0 }; }
     async hideBackgroundOverlay() {
         for (const [id] of this.connections) {
             try {

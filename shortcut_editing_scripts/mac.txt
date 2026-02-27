@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Mac script to add --remote-debugging-port=9000 to Cursor or Antigravity
+# Run this command in Terminal to launch with the flag, or modify the app's Info.plist permanently.
+
+IDE_NAME="Cursor"  # Change to "Antigravity" if needed
+
+# Option 1: Launch with flag (temporary)
+echo "Launching $IDE_NAME with remote debugging port 9000..."
+open -n -a "$IDE_NAME" --args --remote-debugging-port=9000 --disable-gpu-driver-bug-workarounds --ignore-gpu-blacklist
+
+# Option 2: Permanently add flag to the app (requires sudo)
+echo ""
+echo "To permanently add the flag, you can edit the app's Info.plist:"
+echo "1. Right-click $IDE_NAME.app in Applications folder"
+echo "2. Select 'Show Package Contents'"
+echo "3. Navigate to Contents/Info.plist"
+echo "4. Add the following under the <dict> section:"
+echo "   <key>LSArguments</key>"
+echo "   <array>"
+echo "     <string>--remote-debugging-port=9000</string>"
+echo "     <string>--disable-gpu-driver-bug-workarounds</string>"
+echo "     <string>--ignore-gpu-blacklist</string>"
+echo "   </array>"
+echo "5. Save and restart $IDE_NAME"
+echo ""
+echo "After making changes, close and restart $IDE_NAME."
