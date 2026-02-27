@@ -531,11 +531,22 @@ var require_settings_panel = __commonJS({
                         <a href="${stripeLinks.LIFETIME}" class="btn-primary" style="background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2);">
                             Lifetime \u2014 $29 one-time
                         </a>
+                        <button onclick="checkPro()" class="btn-outline" style="margin-top: 16px; width: 100%;">
+                            \u2713 I already paid \u2014 verify my license
+                        </button>
+                        <div id="checkProStatus" style="font-size: 12px; margin-top: 8px; text-align: center; min-height: 18px; color: var(--fg-dim);"></div>
                     </div>
                 </div>
                 <script>
                     const vscode = acquireVsCodeApi();
                     function dismiss() {
+                        vscode.postMessage({ command: 'dismissPrompt' });
+                    }
+                    function checkPro() {
+                        const el = document.getElementById('checkProStatus');
+                        if (el) el.innerText = 'Checking license...';
+                        vscode.postMessage({ command: 'checkPro' });
+                    }
                         vscode.postMessage({ command: 'dismissPrompt' });
                     }
                 </script>
@@ -566,6 +577,9 @@ var require_settings_panel = __commonJS({
                             $29 Lifetime
                         </a>
                     </div>
+                    <button onclick="vscode.postMessage({ command: 'checkPro' })" class="btn-outline" style="margin-top: 12px; width: 100%;">
+                        \u2713 I already paid \u2014 verify my license
+                    </button>
                 </div>
                 ` : ""}
 
@@ -6332,6 +6346,11 @@ function startProPolling(context) {
     "Payment received! Verifying your Pro status... This may take a moment."
   );
   proPollingTimer = setInterval(async () => {
+    const isProNow = await verifyLicense(context);
+    if (isProNow === null) {
+      log("Pro Polling: Network error \u2014 not counting attempt, will retry...");
+      return;
+    }
     proPollingAttempts++;
     log(`Pro Polling: Attempt ${proPollingAttempts}/${MAX_PRO_POLLING_ATTEMPTS}`);
     if (proPollingAttempts > MAX_PRO_POLLING_ATTEMPTS) {
@@ -6339,7 +6358,7 @@ function startProPolling(context) {
       proPollingTimer = null;
       log("Pro Polling: Max attempts reached. User should check manually.");
       vscode.window.showWarningMessage(
-        'Pro verification is taking longer than expected. Please click "Check Pro Status" in settings, or contact support if the issue persists.',
+        'Pro verification is taking longer than expected. Open Settings and click "I already paid" to retry.',
         "Open Settings"
       ).then((choice) => {
         if (choice === "Open Settings") {
@@ -6349,7 +6368,6 @@ function startProPolling(context) {
       });
       return;
     }
-    const isProNow = await verifyLicense(context);
     if (isProNow) {
       clearInterval(proPollingTimer);
       proPollingTimer = null;

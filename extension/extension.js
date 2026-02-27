@@ -1183,6 +1183,12 @@ function startProPolling(context) {
     );
 
     proPollingTimer = setInterval(async () => {
+        const isProNow = await verifyLicense(context);
+        if (isProNow === null) {
+            log('Pro Polling: Network error — not counting attempt, will retry...');
+            return; // Don't burn attempt slots on transient network failures
+        }
+
         proPollingAttempts++;
         log(`Pro Polling: Attempt ${proPollingAttempts}/${MAX_PRO_POLLING_ATTEMPTS}`);
 
@@ -1191,7 +1197,7 @@ function startProPolling(context) {
             proPollingTimer = null;
             log('Pro Polling: Max attempts reached. User should check manually.');
             vscode.window.showWarningMessage(
-                'Pro verification is taking longer than expected. Please click "Check Pro Status" in settings, or contact support if the issue persists.',
+                'Pro verification is taking longer than expected. Open Settings and click "I already paid" to retry.',
                 'Open Settings'
             ).then(choice => {
                 if (choice === 'Open Settings') {
@@ -1202,12 +1208,10 @@ function startProPolling(context) {
             return;
         }
 
-        const isProNow = await verifyLicense(context);
         if (isProNow) {
             clearInterval(proPollingTimer);
             proPollingTimer = null;
 
-            // Update state
             isPro = true;
             await context.globalState.update(PRO_STATE_KEY, true);
 
@@ -1222,7 +1226,6 @@ function startProPolling(context) {
             }
 
             updateStatusBar();
-
             await handlePaidActivation(context);
 
             log('Pro Polling: SUCCESS - Pro status confirmed!');
