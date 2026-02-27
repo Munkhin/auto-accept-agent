@@ -187,12 +187,14 @@
         const state = window.__autoAcceptState;
         const ide = state ? state.ide : 'cursor';
         if (ide === 'antigravity') {
-            return ['.bg-ide-button-background', 'button.cursor-pointer', 'button'];
+            return ['.bg-ide-button-background', 'button.bg-primary', 'button.rounded-l'];
         }
         return ['button', '[class*="button"]', '[class*="anysphere"]'];
     }
 
     function clickAcceptButtons() {
+        // Pause while user is manually interacting with the IDE
+        if (window.__autoAcceptState?.userInteracting) return 0;
         const selectors = getButtonSelectors();
         let clicked = 0;
         for (const selector of selectors) {
@@ -993,7 +995,11 @@
             _noTabCycles: 0,
             summaryRequestPending: false,
             summaryRequestedAt: 0,
-            lastSummary: ''
+            lastSummary: '',
+            // User interaction pause
+            userInteracting: false,
+            _userInteractingTimer: null,
+            _onUserInteract: null
         };
     }
 
@@ -1069,6 +1075,20 @@
         state._noTabCycles = 0;
         state.summaryRequestPending = false;
         state.summaryRequestedAt = 0;
+        state.userInteracting = false;
+        if (state._userInteractingTimer) { clearTimeout(state._userInteractingTimer); state._userInteractingTimer = null; }
+
+        // Pause clicking when user mousedowns anywhere in the IDE window
+        if (state._onUserInteract) document.removeEventListener('mousedown', state._onUserInteract, true);
+        const onUserInteract = () => {
+            const s = window.__autoAcceptState;
+            if (!s || !s.isRunning) return;
+            s.userInteracting = true;
+            if (s._userInteractingTimer) clearTimeout(s._userInteractingTimer);
+            s._userInteractingTimer = setTimeout(() => { s.userInteracting = false; }, 1500);
+        };
+        state._onUserInteract = onUserInteract;
+        document.addEventListener('mousedown', onUserInteract, true);
 
         // Apply banned commands if provided
         if (config.bannedCommands) {
@@ -1124,6 +1144,16 @@
             clearInterval(state.clickInterval);
             state.clickInterval = null;
         }
+
+        if (state._onUserInteract) {
+            document.removeEventListener('mousedown', state._onUserInteract, true);
+            state._onUserInteract = null;
+        }
+        if (state._userInteractingTimer) {
+            clearTimeout(state._userInteractingTimer);
+            state._userInteractingTimer = null;
+        }
+        state.userInteracting = false;
 
         // Dismount overlay if it was mounted (safe to call even if no overlay)
         dismountOverlay();

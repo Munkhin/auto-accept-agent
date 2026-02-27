@@ -55,7 +55,7 @@ class SetupPanel {
                         vscode.window.showInformationMessage('✅ Script copied to clipboard!');
                         return;
                     case 'openHelp':
-                        vscode.env.openExternal(vscode.Uri.parse('https://github.com/MunKhin/auto-accept-agent/blob/master/SETUP_GUIDE.md'));
+                        vscode.env.openExternal(vscode.Uri.parse('https://github.com/Munkhin/auto-accept-agent/blob/master/extension/SETUP_GUIDE.md'));
                         return;
                 }
             },

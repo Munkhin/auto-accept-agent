@@ -4752,7 +4752,7 @@ var require_setup_panel = __commonJS({
                 vscode2.window.showInformationMessage("\u2705 Script copied to clipboard!");
                 return;
               case "openHelp":
-                vscode2.env.openExternal(vscode2.Uri.parse("https://github.com/MunKhin/auto-accept-agent/blob/master/SETUP_GUIDE.md"));
+                vscode2.env.openExternal(vscode2.Uri.parse("https://github.com/Munkhin/auto-accept-agent/blob/master/extension/SETUP_GUIDE.md"));
                 return;
             }
           },
