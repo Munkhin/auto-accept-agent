@@ -2,7 +2,7 @@
     "name": "auto-accept-agent",
     "displayName": "Auto Accept Agent",
     "description": "Auto-accept file edits, terminal commands, and agent prompts in Cursor and Antigravity. Keep your AI agents running hands-free.",
-    "version": "12.3.0",
+    "version": "12.3.1",
     "publisher": "MunKhin",
     "license": "SEE LICENSE IN LICENSE.md",
     "icon": "media/icon.png",
